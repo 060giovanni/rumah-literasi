@@ -1,0 +1,341 @@
+const ApiError = require('../libs/error');
+const ApiResponse = require('../libs/response');
+const SearchService = require('../libs/search-service');
+const LogService = require('../libs/log-service');
+
+const { Address, sequelize } = require('../models');
+const { ROLES } = require('../libs/constant');
+const { Op } = require('sequelize');
+const biteship = require('../libs/biteship');
+
+const searchService = new SearchService(sequelize);
+
+async function assertPostalCodeRegistered(zipcode) {
+	if (!zipcode) {
+		throw new ApiError(400, 'Kode pos wajib diisi');
+	}
+	try {
+		const { data } = await biteship.get('maps/areas', {
+			params: {
+				countries: 'ID',
+				input: String(zipcode),
+				type: 'single',
+			},
+		});
+		const areas = data?.areas || [];
+		if (areas.length === 0) {
+			throw new ApiError(
+				400,
+				`Kode pos ${zipcode} tidak terdaftar di layanan pengiriman. Gunakan kode pos yang valid.`
+			);
+		}
+	} catch (err) {
+		if (err instanceof ApiError) throw err;
+		throw new ApiError(
+			err.response?.status || 502,
+			err.response?.data?.error ||
+				err.response?.data?.message ||
+				'Gagal memverifikasi kode pos ke layanan pengiriman'
+		);
+	}
+}
+
+const AddressController = {
+	async index(req, res, next) {
+		try {
+			const { search, page, limit, status } = req.query;
+			const address = Address.scope({
+				method: ['authorize', req.user, [ROLES.ADMIN]],
+			});
+
+			const filters = {};
+			if (status) filters.is_default = status === 'default';
+
+			const paginate = searchService.paginate({ page, limit });
+			const result = await searchService.search(
+				address,
+				search,
+				filters,
+				{ page, limit },
+				['user', 'province', 'city', 'district'],
+				[
+					'$user.name$',
+					'$user.email$',
+					'contact_name',
+					'contact_phone',
+					'street_address',
+					'zipcode',
+				]
+			);
+
+			return res.json(
+				new ApiResponse('Addresses retrieved successfully', {
+					rows: result.rows,
+					pagination: {
+						total: result.count,
+						page: paginate.page,
+						limit: paginate.limit,
+						pages: Math.ceil(result.count / paginate.limit),
+					},
+				})
+			);
+		} catch (error) {
+			next(error);
+		}
+	},
+
+	async store(req, res, next) {
+		let createdAreaId = null;
+		const t = await sequelize.transaction();
+		try {
+			const addresses = await Address.scope({
+				method: ['authorize', req.user],
+			}).findAll({ transaction: t });
+
+			if (addresses.length >= 10) {
+				throw new ApiError(
+					400,
+					"You've reached the maximum limit of addresses"
+				);
+			}
+
+			await assertPostalCodeRegistered(req.body.zipcode);
+
+			const { data } = await biteship.post('/locations', {
+				name: req.body.name,
+				contact_name: req.body.contact_name,
+				contact_phone: req.body.contact_phone,
+				address: req.body.street_address,
+				note: req.body.note,
+				postal_code: req.body.zipcode,
+				latitude: req.body.latitude,
+				longitude: req.body.longitude,
+				type: 'origin',
+			});
+			createdAreaId = data.id;
+
+			const address = await Address.create(
+				{
+					...req.body,
+					user_id: req.user.id,
+					area_id: data.id,
+					is_default: addresses.length === 0,
+				},
+				{ transaction: t }
+			);
+
+			await t.commit();
+
+			await LogService.createLog(
+				'Menambah Alamat Baru',
+				req.user.id,
+				'address',
+				address.id,
+				`${req.user.name} menambah alamat "${address.name}"`,
+				{
+					address_id: address.id,
+					area_id: address.area_id,
+					zipcode: address.zipcode,
+				},
+				req
+			);
+
+			return res.json(new ApiResponse('Address created successfully', address));
+		} catch (error) {
+			if (!t.finished) await t.rollback();
+			if (createdAreaId) {
+				try {
+					await biteship.delete('/locations/' + createdAreaId);
+				} catch (cleanupErr) {
+					console.error(
+						'Biteship cleanup failed for orphan location',
+						createdAreaId,
+						cleanupErr.response?.data || cleanupErr.message
+					);
+				}
+			}
+			if (error.response) {
+				return next(
+					new ApiError(
+						error.response.status || 500,
+						error.response.data?.message || error.message,
+						error.response.data
+					)
+				);
+			}
+			next(error);
+		}
+	},
+
+	async setDefault(req, res, next) {
+		try {
+			const id = req.params.id;
+			if (!id) throw new ApiError(400, 'ID is required');
+
+			const address = await Address.findOne({
+				where: { id, user_id: req.user.id },
+			});
+
+			if (!address) throw new ApiError(404, 'Address not found');
+			await Address.update(
+				{ is_default: false },
+				{
+					where: {
+						user_id: req.user.id,
+						id: { [Op.ne]: id },
+					},
+				}
+			);
+			await address.update({ is_default: true });
+			await address.save();
+
+			await LogService.createLog(
+				'Mengubah Alamat Default',
+				req.user.id,
+				'address',
+				address.id,
+				`${req.user.name} menjadikan alamat "${address.name}" sebagai default`,
+				{ address_id: address.id },
+				req
+			);
+
+			return res.json(
+				new ApiResponse('Default address updated successfully', address)
+			);
+		} catch (error) {
+			next(error);
+		}
+	},
+
+	async show(req, res, next) {
+		try {
+			const id = req.params.id;
+			if (!id) throw new ApiError(400, 'ID is required');
+
+			const address = await Address.scope({
+				method: ['authorize', req.user, [ROLES.ADMIN]],
+			}).findOne({
+				where: { id },
+				include: ['user', 'province', 'city', 'district'],
+			});
+
+			if (!address) throw new ApiError(404, 'Address not found');
+			return res.json(
+				new ApiResponse('Address retrieved successfully', address)
+			);
+		} catch (error) {
+			next(error);
+		}
+	},
+
+	async update(req, res, next) {
+		const t = await sequelize.transaction();
+		try {
+			const id = req.params.id;
+			if (!id) throw new ApiError(400, 'ID is required');
+
+			const address = await Address.findOne({
+				where: { id, user_id: req.user.id },
+				transaction: t,
+			});
+
+			if (!address) throw new ApiError(404, 'Address not found');
+
+			if (req.body.zipcode && req.body.zipcode !== address.zipcode) {
+				await assertPostalCodeRegistered(req.body.zipcode);
+			}
+
+			await address.update(req.body, { transaction: t });
+			await biteship.post('/locations/' + address.area_id, {
+				name: req.body.name,
+				contact_name: req.body.contact_name,
+				contact_phone: req.body.contact_phone,
+				address: req.body.street_address,
+				note: req.body.note,
+				postal_code: req.body.zipcode,
+				latitude: req.body.latitude,
+				longitude: req.body.longitude,
+			});
+
+			await t.commit();
+
+			await LogService.createLog(
+				'Mengupdate Alamat',
+				req.user.id,
+				'address',
+				address.id,
+				`${req.user.name} mengupdate alamat "${address.name}"`,
+				{ address_id: address.id },
+				req
+			);
+
+			return res.json(new ApiResponse('Address updated successfully', address));
+		} catch (error) {
+			if (!t.finished) await t.rollback();
+			if (error.response) {
+				return next(
+					new ApiError(
+						error.response.status || 500,
+						error.response.data?.message || error.message,
+						error.response.data
+					)
+				);
+			}
+			next(error);
+		}
+	},
+
+	async destroy(req, res, next) {
+		const t = await sequelize.transaction();
+		try {
+			const id = req.params.id;
+			if (!id) throw new ApiError(400, 'ID is required');
+
+			const address = await Address.findOne({
+				where: { id, user_id: req.user.id },
+				transaction: t,
+			});
+
+			if (!address) throw new ApiError(404, 'Address not found');
+
+			const areaId = address.area_id;
+			await address.destroy({ transaction: t });
+
+			try {
+				await biteship.delete('/locations/' + areaId);
+			} catch (biteErr) {
+				if (biteErr.response?.status !== 404) {
+					throw biteErr;
+				}
+			}
+
+			await t.commit();
+
+			await LogService.createLog(
+				'Menghapus Alamat',
+				req.user.id,
+				'address',
+				address.id,
+				`${req.user.name} menghapus alamat "${address.name}"`,
+				{ address_id: address.id, area_id: areaId },
+				req
+			);
+
+			return res.json(new ApiResponse('Address deleted successfully', address));
+		} catch (error) {
+			if (!t.finished) await t.rollback();
+			if (error.response) {
+				return next(
+					new ApiError(
+						error.response.status || 500,
+						error.response.data?.message || error.message,
+						error.response.data
+					)
+				);
+			}
+			next(error);
+		}
+	},
+};
+
+module.exports = AddressController;
